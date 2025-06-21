@@ -1,11 +1,13 @@
 use std::{env, io::Error};
 
+use futures_util::SinkExt;
 use futures_util::StreamExt;
 use log::info;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
@@ -16,21 +18,27 @@ enum ClientMessage {
         id: Uuid,
     },
     MoveTo {
-        x: u8,
-        y: u8,
+        id: Uuid,
+        x: u32,
+        y: u32,
     },
     CastSpell {
         spell_id: u32,
-        target_x: u8,
-        target_y: u8,
+        target_x: u32,
+        target_y: u32,
     },
 }
 
 enum ServerMessage {
-    GameStateSnapshot { game_state: GameState },
+    GameStateSnapshot {
+        game_state: GameState,
+    },
+    CharactersSnapshot {
+        characters: HashMap<Uuid, Character>,
+    },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct Character {
     id: Uuid,
     x: u32,
@@ -40,19 +48,39 @@ struct Character {
 #[derive(Debug, Default, Clone)]
 struct GameState {
     online_characters: HashMap<Uuid, Character>,
+    sessions: HashMap<Uuid, UnboundedSender<HashMap<Uuid, Character>>>,
 }
 
 impl GameState {
     fn apply_event(&mut self, event: GameEvent) {
         match event {
-            GameEvent::CharacterJoined { id } => {
+            GameEvent::CharacterJoined { id, session_tx } => {
                 self.online_characters
                     .insert(id, Character { id: id, x: 0, y: 0 });
+                self.sessions.insert(id, session_tx);
                 info!("Character {} has joined the world.", id);
+
+                for session_tx in self.sessions.values() {
+                    let _ = session_tx.send(self.online_characters.clone());
+                }
             }
             GameEvent::CharacterLeft { id } => {
                 self.online_characters.remove(&id);
+                self.sessions.remove(&id);
                 info!("Character {} has left the world.", id);
+
+                for session_tx in self.sessions.values() {
+                    let _ = session_tx.send(self.online_characters.clone());
+                }
+            }
+            GameEvent::CharacterMoved { id, x, y } => {
+                if let Some(character) = self.online_characters.get_mut(&id) {
+                    character.x = x;
+                    character.y = y;
+                }
+                for session_tx in self.sessions.values() {
+                    let _ = session_tx.send(self.online_characters.clone());
+                }
             }
             GameEvent::Snapshot { sender } => {
                 let n = self.online_characters.len();
@@ -65,9 +93,15 @@ impl GameState {
 enum GameEvent {
     CharacterJoined {
         id: Uuid,
+        session_tx: UnboundedSender<HashMap<Uuid, Character>>,
     },
     CharacterLeft {
         id: Uuid,
+    },
+    CharacterMoved {
+        id: Uuid,
+        x: u32,
+        y: u32,
     },
     Snapshot {
         sender: tokio::sync::oneshot::Sender<usize>,
@@ -123,7 +157,7 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
-async fn accept_connection(stream: TcpStream, tx: tokio::sync::mpsc::Sender<GameEvent>) {
+async fn accept_connection(stream: TcpStream, game_tx: tokio::sync::mpsc::Sender<GameEvent>) {
     let addr = stream
         .peer_addr()
         .expect("connected streams should have a peer address");
@@ -135,8 +169,27 @@ async fn accept_connection(stream: TcpStream, tx: tokio::sync::mpsc::Sender<Game
 
     info!("New WebSocket connection: {}", addr);
     let mut character_id: Option<Uuid> = None;
-
+    // Client -> server_client_task
     let (mut write, mut read) = ws_stream.split();
+
+    // server_client_task -> server_gs_task
+    let (client_tx, mut client_rx): (
+        UnboundedSender<HashMap<Uuid, Character>>,
+        UnboundedReceiver<HashMap<Uuid, Character>>,
+    ) = mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        while let Some(characters) = client_rx.recv().await {
+            match serde_json::to_string(&characters) {
+                Ok(json) => {
+                    let _ = write.send(Message::Text(json.into())).await;
+                }
+                Err(e) => {
+                    log::error!("Failed to serialize characters: {}", e);
+                }
+            }
+        }
+    });
 
     while let Some(result) = read.next().await {
         match result {
@@ -144,10 +197,17 @@ async fn accept_connection(stream: TcpStream, tx: tokio::sync::mpsc::Sender<Game
                 match serde_json::from_str::<ClientMessage>(&text) {
                     Ok(client_msg) => match client_msg {
                         ClientMessage::JoinGame { id } => {
-                            let _ = tx.send(GameEvent::CharacterJoined { id }).await;
+                            let _ = game_tx
+                                .send(GameEvent::CharacterJoined {
+                                    id,
+                                    session_tx: client_tx.clone(),
+                                })
+                                .await;
                             character_id = Some(id);
                         }
-                        ClientMessage::MoveTo { x, y } => {}
+                        ClientMessage::MoveTo { id, x, y } => {
+                            let _ = game_tx.send(GameEvent::CharacterMoved { id, x, y }).await;
+                        }
                         ClientMessage::CastSpell {
                             spell_id,
                             target_x,
@@ -168,7 +228,7 @@ async fn accept_connection(stream: TcpStream, tx: tokio::sync::mpsc::Sender<Game
                 info!("🔚 {} closed the connection", addr);
 
                 if let Some(id) = character_id {
-                    let _ = tx.send(GameEvent::CharacterLeft { id: id }).await;
+                    let _ = game_tx.send(GameEvent::CharacterLeft { id: id }).await;
                 }
                 break;
             }
@@ -182,7 +242,7 @@ async fn accept_connection(stream: TcpStream, tx: tokio::sync::mpsc::Sender<Game
                 // ⚠️ Unexpected socket error (client crashed, Ctrl-C, unplugged, etc.)
                 info!("❌ WebSocket error from {}: {}", addr, e);
                 if let Some(id) = character_id {
-                    let _ = tx.send(GameEvent::CharacterLeft { id: id }).await;
+                    let _ = game_tx.send(GameEvent::CharacterLeft { id: id }).await;
                 }
 
                 break;
