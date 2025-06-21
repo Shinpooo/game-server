@@ -5,7 +5,7 @@ use log::info;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
@@ -30,14 +30,14 @@ enum ServerMessage {
     GameStateSnapshot { game_state: GameState },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Character {
     id: Uuid,
     x: u32,
     y: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct GameState {
     online_characters: HashMap<Uuid, Character>,
 }
@@ -48,13 +48,30 @@ impl GameState {
             GameEvent::CharacterJoined { id } => {
                 self.online_characters
                     .insert(id, Character { id: id, x: 0, y: 0 });
+                info!("Character {} has joined the world.", id);
+            }
+            GameEvent::CharacterLeft { id } => {
+                self.online_characters.remove(&id);
+                info!("Character {} has left the world.", id);
+            }
+            GameEvent::Snapshot { sender } => {
+                let n = self.online_characters.len();
+                let _ = sender.send(n);
             }
         }
     }
 }
 
 enum GameEvent {
-    CharacterJoined { id: Uuid },
+    CharacterJoined {
+        id: Uuid,
+    },
+    CharacterLeft {
+        id: Uuid,
+    },
+    Snapshot {
+        sender: tokio::sync::oneshot::Sender<usize>,
+    },
 }
 
 #[tokio::main]
@@ -70,22 +87,24 @@ async fn main() -> Result<(), Error> {
     info!("LOG server Listening on: {}", addr);
 
     // let state = Arc::new(Mutex::new(GameState::default()));
-    let state = GameState::default();
-    let (tx, rx) = mpsc::channel::<GameEvent>(32);
-
+    let mut state = GameState::default();
+    let (tx, mut rx) = mpsc::channel::<GameEvent>(32);
+    let tx_monitor = tx.clone();
     // Spawn monitoring task
-    let monitor_state = state.clone();
+    // let monitor_state = state.clone();
     tokio::spawn(async move {
         loop {
+            let (tx1, rx1) = oneshot::channel::<usize>();
+            let _ = tx_monitor.send(GameEvent::Snapshot { sender: (tx1) }).await;
+            let count = rx1.await.unwrap();
+            log::info!("👥 Currently connected players: {}", count);
             // Wait 5 seconds
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
             // Lock the state and read the number of online players
-            let gs = monitor_state.lock().await;
-            let count = gs.online_characters.len();
-            drop(gs);
-
-            log::info!("👥 Currently connected players: {}", count);
+            // let gs = monitor_state.lock().await;
+            // let count = gs.online_characters.len();
+            // drop(gs);
         }
     });
 
@@ -96,19 +115,15 @@ async fn main() -> Result<(), Error> {
     });
 
     while let Ok((stream, _)) = listener.accept().await {
-        let conn_state = state.clone();
+        // let conn_state = state.clone();
         let client_tx = tx.clone();
-        tokio::spawn(async move { accept_connection(stream, conn_state, client_tx).await });
+        tokio::spawn(async move { accept_connection(stream, client_tx).await });
     }
 
     Ok(())
 }
 
-async fn accept_connection(
-    stream: TcpStream,
-    state: Arc<Mutex<GameState>>,
-    tx: tokio::sync::mpsc::Sender<GameEvent>,
-) {
+async fn accept_connection(stream: TcpStream, tx: tokio::sync::mpsc::Sender<GameEvent>) {
     let addr = stream
         .peer_addr()
         .expect("connected streams should have a peer address");
@@ -129,19 +144,10 @@ async fn accept_connection(
                 match serde_json::from_str::<ClientMessage>(&text) {
                     Ok(client_msg) => match client_msg {
                         ClientMessage::JoinGame { id } => {
-                            tx.send(GameEvent::CharacterJoined { id });
-                            let mut gs = state.lock().await;
-                            gs.online_characters
-                                .insert(id, Character { id, x: 0, y: 0 });
-                            drop(gs);
-                            info!("Character {} joined the world", id);
+                            let _ = tx.send(GameEvent::CharacterJoined { id }).await;
                             character_id = Some(id);
-
-                            // create player, assign ID, send welcome
                         }
-                        ClientMessage::MoveTo { x, y } => {
-                            // update player position, broadcast
-                        }
+                        ClientMessage::MoveTo { x, y } => {}
                         ClientMessage::CastSpell {
                             spell_id,
                             target_x,
@@ -154,18 +160,15 @@ async fn accept_connection(
                         eprintln!("Failed to parse message: {:?}", e);
                     }
                 }
-                // info!("📩 Received text from {}: {}", addr, text);
             }
             Ok(Message::Binary(data)) => {
                 info!("📦 Received binary from {}: {:?}", addr, data);
             }
             Ok(Message::Close(_)) => {
                 info!("🔚 {} closed the connection", addr);
+
                 if let Some(id) = character_id {
-                    let mut gs = state.lock().await;
-                    gs.online_characters.remove_entry(&id);
-                    drop(gs);
-                    info!("Character {} left the world", id);
+                    let _ = tx.send(GameEvent::CharacterLeft { id: id }).await;
                 }
                 break;
             }
@@ -179,10 +182,7 @@ async fn accept_connection(
                 // ⚠️ Unexpected socket error (client crashed, Ctrl-C, unplugged, etc.)
                 info!("❌ WebSocket error from {}: {}", addr, e);
                 if let Some(id) = character_id {
-                    let mut gs = state.lock().await;
-                    gs.online_characters.remove_entry(&id);
-                    drop(gs);
-                    info!("Character {} left the world", id);
+                    let _ = tx.send(GameEvent::CharacterLeft { id: id }).await;
                 }
 
                 break;
