@@ -163,9 +163,13 @@ async fn accept_connection(stream: TcpStream, game_tx: tokio::sync::mpsc::Sender
         .expect("connected streams should have a peer address");
     info!("Peer address: {}", addr);
 
-    let ws_stream = tokio_tungstenite::accept_async(stream)
-        .await
-        .expect("Error during the websocket handshake occurred");
+    let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+        Ok(ws) => ws,
+        Err(e) => {
+            info!("Failed WebSocket handshake from {}: {}", addr, e);
+            return;
+        }
+    };
 
     info!("New WebSocket connection: {}", addr);
     let mut character_id: Option<Uuid> = None;

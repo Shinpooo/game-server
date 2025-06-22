@@ -16,5 +16,10 @@ RUN cargo build --release --bin game-server
 # We do not need the Rust toolchain to run the binary!
 FROM debian:bookworm-slim AS runtime
 WORKDIR /app
+# Install OpenSSL for TLS support
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/game-server /usr/local/bin
 ENTRYPOINT ["/usr/local/bin/game-server"]

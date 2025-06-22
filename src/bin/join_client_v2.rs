@@ -19,7 +19,7 @@ struct Character {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (ws_stream, _) = connect_async("ws://127.0.0.1:8080").await?;
+    let (ws_stream, _) = connect_async("wss://zen-server.fly.dev").await?;
     println!("✅ Connected to server");
 
     let (mut write, mut read) = ws_stream.split();
