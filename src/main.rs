@@ -27,6 +27,10 @@ enum ClientMessage {
         target_x: u32,
         target_y: u32,
     },
+    Chat {
+        id: Uuid,
+        text: String,
+    },
 }
 
 enum ServerMessage {
@@ -38,7 +42,7 @@ enum ServerMessage {
     },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Character {
     id: Uuid,
     x: u32,
@@ -48,7 +52,7 @@ struct Character {
 #[derive(Debug, Default, Clone)]
 struct GameState {
     online_characters: HashMap<Uuid, Character>,
-    sessions: HashMap<Uuid, UnboundedSender<HashMap<Uuid, Character>>>,
+    sessions: HashMap<Uuid, UnboundedSender<OutgoingMessage>>,
 }
 
 impl GameState {
@@ -61,7 +65,9 @@ impl GameState {
                 info!("Character {} has joined the world.", id);
 
                 for session_tx in self.sessions.values() {
-                    let _ = session_tx.send(self.online_characters.clone());
+                    let _ = session_tx.send(OutgoingMessage::CharactersSnapshot {
+                        characters: (self.online_characters.clone()),
+                    });
                 }
             }
             GameEvent::CharacterLeft { id } => {
@@ -70,7 +76,18 @@ impl GameState {
                 info!("Character {} has left the world.", id);
 
                 for session_tx in self.sessions.values() {
-                    let _ = session_tx.send(self.online_characters.clone());
+                    let _ = session_tx.send(OutgoingMessage::CharactersSnapshot {
+                        characters: (self.online_characters.clone()),
+                    });
+                }
+            }
+
+            GameEvent::ChatMessage { id, text } => {
+                for session_tx in self.sessions.values() {
+                    let _ = session_tx.send(OutgoingMessage::ChatBroadcast {
+                        id,
+                        text: text.clone(),
+                    });
                 }
             }
             GameEvent::CharacterMoved { id, x, y } => {
@@ -89,7 +106,9 @@ impl GameState {
                     character.y = y;
                 }
                 for session_tx in self.sessions.values() {
-                    let _ = session_tx.send(self.online_characters.clone());
+                    let _ = session_tx.send(OutgoingMessage::CharactersSnapshot {
+                        characters: self.online_characters.clone(),
+                    });
                 }
             }
             GameEvent::Snapshot { sender } => {
@@ -103,7 +122,7 @@ impl GameState {
 enum GameEvent {
     CharacterJoined {
         id: Uuid,
-        session_tx: UnboundedSender<HashMap<Uuid, Character>>,
+        session_tx: UnboundedSender<OutgoingMessage>,
     },
     CharacterLeft {
         id: Uuid,
@@ -115,6 +134,22 @@ enum GameEvent {
     },
     Snapshot {
         sender: tokio::sync::oneshot::Sender<usize>,
+    },
+    ChatMessage {
+        id: Uuid,
+        text: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type")]
+enum OutgoingMessage {
+    CharactersSnapshot {
+        characters: HashMap<Uuid, Character>,
+    },
+    ChatBroadcast {
+        id: Uuid,
+        text: String,
     },
 }
 
@@ -188,13 +223,13 @@ async fn accept_connection(stream: TcpStream, game_tx: tokio::sync::mpsc::Sender
 
     // server_client_task -> server_gs_task
     let (client_tx, mut client_rx): (
-        UnboundedSender<HashMap<Uuid, Character>>,
-        UnboundedReceiver<HashMap<Uuid, Character>>,
+        UnboundedSender<OutgoingMessage>,
+        UnboundedReceiver<OutgoingMessage>,
     ) = mpsc::unbounded_channel();
 
     tokio::spawn(async move {
-        while let Some(characters) = client_rx.recv().await {
-            match serde_json::to_string(&characters) {
+        while let Some(msg) = client_rx.recv().await {
+            match serde_json::to_string(&msg) {
                 Ok(json) => {
                     let _ = write.send(Message::Text(json.into())).await;
                 }
@@ -218,6 +253,9 @@ async fn accept_connection(stream: TcpStream, game_tx: tokio::sync::mpsc::Sender
                                 })
                                 .await;
                             character_id = Some(id);
+                        }
+                        ClientMessage::Chat { id, text } => {
+                            let _ = game_tx.send(GameEvent::ChatMessage { id, text }).await;
                         }
                         ClientMessage::MoveTo { id, x, y } => {
                             let _ = game_tx.send(GameEvent::CharacterMoved { id, x, y }).await;
