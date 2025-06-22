@@ -74,6 +74,15 @@ impl GameState {
                 }
             }
             GameEvent::CharacterMoved { id, x, y } => {
+                if x >= 10 || y >= 10 {
+                    log::info!(
+                        "⛔ Rejected move for {} to out-of-bounds position: ({}, {})",
+                        id,
+                        x,
+                        y
+                    );
+                    return;
+                }
                 if let Some(character) = self.online_characters.get_mut(&id) {
                     character.x = x;
                     character.y = y;
