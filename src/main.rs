@@ -231,6 +231,7 @@ async fn accept_connection(stream: TcpStream, game_tx: tokio::sync::mpsc::Sender
         while let Some(msg) = client_rx.recv().await {
             match serde_json::to_string(&msg) {
                 Ok(json) => {
+                    info!("Sending message: {}", json);
                     let _ = write.send(Message::Text(json.into())).await;
                 }
                 Err(e) => {
